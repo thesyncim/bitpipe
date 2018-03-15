@@ -1,27 +1,60 @@
 package bitpipe
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"io"
+	"io/ioutil"
 	"os"
 	"strings"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/fsouza/go-dockerclient"
+	"gopkg.in/src-d/go-git.v4"
+	"gopkg.in/src-d/go-git.v4/plumbing"
 )
 
+//Pipeline contains all necessary information to process a pipeline
 type Pipeline struct {
+	RepoURL      string
+	Revision     string
 	Image        string
 	Commands     []string
 	WorkDir      string
 	OutputStream io.Writer
-	Bind         string
+	Bind         string   //local folder to container
+	EnvFile      string   // file in  format name=value
+	Env          []string //format name=value override EnvFile
 
 	client    *docker.Client
 	container *docker.Container
 }
 
+func (p *Pipeline) clone() error {
+	dir, err := ioutil.TempDir("", "pipeline")
+	if err != nil {
+		return err
+	}
+	repo, err := git.PlainClone(dir, false, &git.CloneOptions{
+		URL:      p.RepoURL,
+		Progress: p.OutputStream,
+	})
+	if err != nil {
+		return err
+	}
+	w, err := repo.Worktree()
+
+	if err := w.Checkout(&git.CheckoutOptions{
+		Hash: plumbing.NewHash(p.Revision),
+	}); err != nil {
+		return err
+	}
+	_, err = repo.Head()
+	return err
+}
+
+//Run runs the pipeline based on the configuration
 func (p *Pipeline) Run() (err error) {
 
 	if err := p.pullImage(); err != nil {
@@ -41,6 +74,11 @@ func (p *Pipeline) Run() (err error) {
 	cmd := []string{"/bin/sh"}
 	// runs properly. Using bash does not seem like an elegant solution,
 	// but this is the best so far.
+
+	res, err := loadEnvFile(p.EnvFile)
+	if err != nil {
+		return err
+	}
 	de := docker.CreateExecOptions{
 		AttachStderr: true,
 		AttachStdin:  true,
@@ -48,6 +86,7 @@ func (p *Pipeline) Run() (err error) {
 		Tty:          false,
 		Cmd:          cmd,
 		Container:    p.container.ID,
+		Env:          append(res, p.Env...),
 	}
 	log.Debug("CreateExec")
 	dExec, err := p.client.CreateExec(de)
@@ -56,7 +95,7 @@ func (p *Pipeline) Run() (err error) {
 		return err
 	}
 	log.Debug("Created Exec")
-	execId := dExec.ID
+	execID := dExec.ID
 
 	pr, pw := io.Pipe()
 	var errBuffer bytes.Buffer
@@ -69,7 +108,7 @@ func (p *Pipeline) Run() (err error) {
 	}
 
 	log.Debug("StartExec")
-	cw, err := p.client.StartExecNonBlocking(execId, opts)
+	cw, err := p.client.StartExecNonBlocking(execID, opts)
 	if err != nil {
 		log.Debug("CreateExec Error: %s", err)
 		return err
@@ -89,7 +128,7 @@ func (p *Pipeline) Run() (err error) {
 		return err
 	}
 
-	inspectResult, err := p.client.InspectExec(execId)
+	inspectResult, err := p.client.InspectExec(execID)
 	if err != nil {
 		return err
 	}
@@ -113,6 +152,7 @@ func (p *Pipeline) pullImage() error {
 	//imageName := "ubuntu:latest"
 
 	repo, tag := img2RepoandTag(p.Image)
+
 	return p.client.PullImage(docker.PullImageOptions{
 		Repository:   repo,
 		Tag:          tag,
@@ -161,4 +201,25 @@ func img2RepoandTag(img string) (string, string) {
 		return s[0], ""
 	}
 	return s[0], s[1]
+}
+
+func loadEnvFile(envfile string) ([]string, error) {
+	file, err := os.Open(envfile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+	var result []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) != "" {
+			result = append(result, line)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
